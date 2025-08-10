@@ -72,6 +72,27 @@ def resolve_interpreter(interpreter: str, logger: logging.Logger) -> str:
     return interpreter
 
 
+def call_with_timeout(fn, args=(), kwargs=None, timeout=10.0):
+    """Execute ``fn`` in a separate daemon thread enforcing ``timeout`` seconds."""
+    result: Dict[str, Any] = {}
+    error: Dict[str, BaseException] = {}
+
+    def runner():
+        try:
+            result["value"] = fn(*args, **(kwargs or {}))
+        except BaseException as e:  # capture and re-raise in main thread
+            error["err"] = e
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError("operation timed out")
+    if "err" in error:
+        raise error["err"]
+    return result.get("value")
+
+
 class RateLimiter:
     """Token bucket rate limiter."""
 
@@ -198,13 +219,25 @@ def run_worker(q: Queue,
             t_start = t0
             status, ok, cf, err, bytes_ = 0, False, False, "", 0
             attempt = 0
-            cached = False
 
-            with cache["lock"]:
-                entry = cache["data"].get(url)
-                if entry and entry[0] > time.time():
-                    cached_res = entry[1]
-                    cached = True
+            # --- cache & single-flight handling ---
+            cached = False
+            owner = False
+            while True:
+                with cache["lock"]:
+                    entry = cache["data"].get(url)
+                    if entry and entry[0] > time.time():
+                        cached_res = entry[1]
+                        cached = True
+                        break
+                    ev = cache["pending"].get(url)
+                    if ev is None:
+                        ev = threading.Event()
+                        cache["pending"][url] = ev
+                        owner = True
+                        break
+                # another thread is fetching; wait for its event
+                ev.wait(hard_timeout)
 
             if cached:
                 elapsed = 0.0
@@ -213,18 +246,20 @@ def run_worker(q: Queue,
                 cf = cached_res["cf"]
                 err = cached_res["err"]
                 bytes_ = cached_res["bytes"]
+                if verbose_requests:
+                    logger.info(f"[{idx:04}] cache-hit")
                 with state["lock"]:
                     state["inflight"] -= 1
                     state["done"] += 1
                     state["latencies"].append(elapsed)
                     if ok: state["ok"] += 1
                     if cf: state["cf"] += 1
-                    if err: state["errors"][err] = state["errors"].get(err, 0) + 1
+                    if err:
+                        state["errors"][err] = state["errors"].get(err, 0) + 1
                     state["start_times"].pop(idx, None)
                 results.append({"idx": idx, "status": status, "ok": ok, "cf": cf,
                                 "err": err, "elapsed": elapsed, "bytes": bytes_,
                                 "cached": True})
-                q.task_done()
                 continue
 
             if verbose_requests:
@@ -248,10 +283,19 @@ def run_worker(q: Queue,
                     proxies = None
                 try:
                     t_req = time.perf_counter()
+                    remaining = max(0.0, hard_timeout - (time.perf_counter() - t_start))
                     if engine == "cloudscraper":
-                        status, text, bytes_ = fetch_with_cloudscraper(sess, url, timeout_tuple, proxies=proxies)
+                        status, text, bytes_ = call_with_timeout(
+                            fetch_with_cloudscraper,
+                            args=(sess, url, timeout_tuple, proxies),
+                            timeout=remaining
+                        )
                     else:
-                        status, text, bytes_ = fetch_with_curlcffi(url, timeout_tuple, proxies=proxies)
+                        status, text, bytes_ = call_with_timeout(
+                            fetch_with_curlcffi,
+                            args=(url, timeout_tuple, proxies),
+                            timeout=remaining
+                        )
 
                     ok = (status == 200 and is_valid_html(text))
                     cf = looks_like_cf(text, status) and not ok
@@ -268,6 +312,11 @@ def run_worker(q: Queue,
                         d = time.perf_counter() - t_req
                         logger.info(f"[{idx:04}] attempt#{attempt} status={status} ok={ok} cf={cf} t={d:.2f}s bytes={bytes_}")
 
+                except TimeoutError:
+                    err = "HardTimeout"
+                    if verbose_requests:
+                        logger.warning(f"[{idx:04}] hard-timeout {hard_timeout}s")
+                    break
                 except requests.exceptions.Timeout:
                     err = "Timeout"
                     if verbose_requests:
@@ -324,6 +373,11 @@ def run_worker(q: Queue,
                 state["errors"]["Crash"] = state["errors"].get("Crash", 0) + 1
                 state["start_times"].pop(idx, None)
         finally:
+            if owner:
+                with cache["lock"]:
+                    ev = cache["pending"].pop(url, None)
+                    if ev:
+                        ev.set()
             q.task_done()
 
 def progress_loop(state: dict, total: int, logger: logging.Logger, every: float, stop_evt: threading.Event):
@@ -411,7 +465,7 @@ def main():
     }
 
     results = []
-    cache = {"data": {}, "lock": threading.Lock(), "ttl": args.cache_ttl}
+    cache = {"data": {}, "lock": threading.Lock(), "ttl": args.cache_ttl, "pending": {}}
 
     proxies = [f"http://127.0.0.1:{args.proxy_start_port + i}" for i in range(args.proxy_count)] if args.proxy_count > 0 else []
     global_rate = args.proxy_global_rate
