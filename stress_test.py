@@ -1,7 +1,7 @@
 # stress_v2_3.py
 # pip install cloudscraper "requests>=2.32" curl_cffi beautifulsoup4 lxml urllib3
 
-import argparse, csv, random, time, math, threading, logging, sys
+import argparse, csv, random, time, math, threading, logging, sys, shutil
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from typing import Dict, Any, List
@@ -55,14 +55,39 @@ def percentiles(vals: List[float], ps=(50,90,99)):
         out[int(p)] = round(vals_sorted[f] if f==c else vals_sorted[f] + (vals_sorted[c]-vals_sorted[f])*(k-f), 3)
     return out
 
+# ---------- helpers ----------
+def resolve_interpreter(interpreter: str, logger: logging.Logger) -> str:
+    """Return a supported JS interpreter for cloudscraper.
+
+    cloudscraper works faster with NodeJS but many environments may not have
+    the ``node`` executable available.  Previously the script would silently
+    fail when ``node`` was missing which caused worker threads to die and the
+    queue to hang forever.  We now check for the presence of NodeJS and
+    transparently fall back to ``js2py`` with a warning so that requests can
+    still be executed.
+    """
+    if interpreter == "nodejs" and shutil.which("node") is None:
+        logger.warning("node interpreter not found, falling back to js2py")
+        return "js2py"
+    return interpreter
+
 # ---------- engines ----------
 def make_cloudscraper(pool_size: int, interpreter: str):
-    s = cloudscraper.create_scraper(
+    params = dict(
         browser={'browser':'chrome','platform':'windows','desktop':True},
-        interpreter=interpreter,            # 'nodejs' предпочтительнее, иначе 'js2py'
-        enable_stealth=True,
-        debug=False
+        interpreter=interpreter,
+        debug=False,
     )
+    # "enable_stealth" was added in newer versions of cloudscraper.  For older
+    # releases the argument is unknown and would raise a TypeError which used to
+    # kill worker threads silently.  Try to enable it and gracefully fall back
+    # if the parameter isn't supported.
+    try:
+        params["enable_stealth"] = True
+        s = cloudscraper.create_scraper(**params)
+    except TypeError:
+        params.pop("enable_stealth", None)
+        s = cloudscraper.create_scraper(**params)
     # ВНУТРЕННИЕ ретраи отключены — ретраи делаем сами с контролируемым бэк-оффом
     adapter = HTTPAdapter(
         pool_connections=pool_size,
@@ -97,7 +122,11 @@ def run_worker(q: Queue,
                interpreter: str):
     sess = None
     if engine == "cloudscraper":
-        sess = make_cloudscraper(pool_size=state["pool_size"], interpreter=interpreter)
+        try:
+            sess = make_cloudscraper(pool_size=state["pool_size"], interpreter=interpreter)
+        except Exception as e:
+            logger.error(f"failed to create cloudscraper session: {e}")
+            return
 
     while True:
         try:
@@ -105,86 +134,94 @@ def run_worker(q: Queue,
         except Empty:
             return
 
-        with state["lock"]:
-            state["inflight"] += 1
-            state["start_times"][idx] = time.perf_counter()
+        try:
+            with state["lock"]:
+                state["inflight"] += 1
+                state["start_times"][idx] = time.perf_counter()
 
-        t0 = time.perf_counter()
-        t_start = t0
-        status, ok, cf, err, bytes_ = 0, False, False, ""
-        attempt = 0
+            t0 = time.perf_counter()
+            t_start = t0
+            status, ok, cf, err, bytes_ = 0, False, False, "", 0
+            attempt = 0
 
-        if verbose_requests:
-            logger.info(f"[{idx:04}] start engine={engine}")
-
-        while True:
-            # абсолютный дедлайн
-            if time.perf_counter() - t_start > hard_timeout:
-                err = "HardTimeout"
-                if verbose_requests:
-                    logger.warning(f"[{idx:04}] hard-timeout {hard_timeout}s")
-                break
-
-            attempt += 1
-            try:
-                t_req = time.perf_counter()
-                if engine == "cloudscraper":
-                    status, text, bytes_ = fetch_with_cloudscraper(sess, url, timeout_tuple)
-                else:
-                    status, text, bytes_ = fetch_with_curlcffi(url, timeout_tuple)
-
-                ok = (status == 200 and is_valid_html(text))
-                cf = looks_like_cf(text, status) and not ok
-                err = ""
-
-                if verbose_requests:
-                    d = time.perf_counter() - t_req
-                    logger.info(f"[{idx:04}] attempt#{attempt} status={status} ok={ok} cf={cf} t={d:.2f}s bytes={bytes_}")
-
-            except requests.exceptions.Timeout:
-                err = "Timeout"
-                if verbose_requests:
-                    logger.warning(f"[{idx:04}] attempt#{attempt} timeout")
-            except requests.exceptions.RequestException as e:
-                err = e.__class__.__name__
-                if verbose_requests:
-                    logger.warning(f"[{idx:04}] attempt#{attempt} err={err}")
-            except Exception as e:
-                err = f"{type(e).__name__}"
-                if verbose_requests:
-                    logger.warning(f"[{idx:04}] attempt#{attempt} err={err}")
-
-            # Условия выхода: успех / исчерпали попытки / не было исключения (получили ответ)
-            if ok or attempt > max_retries or err == "":
-                break
-
-            # Экспоненциальный бэк-офф с джиттером, но не больше 5с
-            delay = backoff0 * (2 ** (attempt - 1)) * random.uniform(0.5, 1.5)
             if verbose_requests:
-                logger.info(f"[{idx:04}] backoff {delay:.2f}s")
-            time.sleep(min(delay, 5.0))
+                logger.info(f"[{idx:04}] start engine={engine}")
 
-        elapsed = time.perf_counter() - t0
+            while True:
+                # абсолютный дедлайн
+                if time.perf_counter() - t_start > hard_timeout:
+                    err = "HardTimeout"
+                    if verbose_requests:
+                        logger.warning(f"[{idx:04}] hard-timeout {hard_timeout}s")
+                    break
 
-        results.append({
-            "idx": idx, "status": status, "ok": ok, "cf": cf, "err": err,
-            "elapsed": round(elapsed, 3), "bytes": bytes_
-        })
+                attempt += 1
+                try:
+                    t_req = time.perf_counter()
+                    if engine == "cloudscraper":
+                        status, text, bytes_ = fetch_with_cloudscraper(sess, url, timeout_tuple)
+                    else:
+                        status, text, bytes_ = fetch_with_curlcffi(url, timeout_tuple)
 
-        with state["lock"]:
-            state["inflight"] -= 1
-            state["done"] += 1
-            state["latencies"].append(elapsed)
-            if ok: state["ok"] += 1
-            if cf: state["cf"] += 1
-            if err: state["errors"][err] = state["errors"].get(err, 0) + 1
-            state["start_times"].pop(idx, None)
+                    ok = (status == 200 and is_valid_html(text))
+                    cf = looks_like_cf(text, status) and not ok
+                    err = ""
 
-        if verbose_requests:
-            label = "OK" if ok else ("CF" if cf else ("ERR" if err else "BAD"))
-            logger.info(f"[{idx:04}] {label} status={status} err={err or '-'} total_t={elapsed:.2f}s")
+                    if verbose_requests:
+                        d = time.perf_counter() - t_req
+                        logger.info(f"[{idx:04}] attempt#{attempt} status={status} ok={ok} cf={cf} t={d:.2f}s bytes={bytes_}")
 
-        q.task_done()
+                except requests.exceptions.Timeout:
+                    err = "Timeout"
+                    if verbose_requests:
+                        logger.warning(f"[{idx:04}] attempt#{attempt} timeout")
+                except requests.exceptions.RequestException as e:
+                    err = e.__class__.__name__
+                    if verbose_requests:
+                        logger.warning(f"[{idx:04}] attempt#{attempt} err={err}")
+                except Exception as e:
+                    err = f"{type(e).__name__}"
+                    if verbose_requests:
+                        logger.warning(f"[{idx:04}] attempt#{attempt} err={err}")
+
+                # Условия выхода: успех / исчерпали попытки / не было исключения (получили ответ)
+                if ok or attempt > max_retries or err == "":
+                    break
+
+                # Экспоненциальный бэк-офф с джиттером, но не больше 5с
+                delay = backoff0 * (2 ** (attempt - 1)) * random.uniform(0.5, 1.5)
+                if verbose_requests:
+                    logger.info(f"[{idx:04}] backoff {delay:.2f}s")
+                time.sleep(min(delay, 5.0))
+
+            elapsed = time.perf_counter() - t0
+
+            results.append({
+                "idx": idx, "status": status, "ok": ok, "cf": cf, "err": err,
+                "elapsed": round(elapsed, 3), "bytes": bytes_
+            })
+
+            with state["lock"]:
+                state["inflight"] -= 1
+                state["done"] += 1
+                state["latencies"].append(elapsed)
+                if ok: state["ok"] += 1
+                if cf: state["cf"] += 1
+                if err: state["errors"][err] = state["errors"].get(err, 0) + 1
+                state["start_times"].pop(idx, None)
+
+            if verbose_requests:
+                label = "OK" if ok else ("CF" if cf else ("ERR" if err else "BAD"))
+                logger.info(f"[{idx:04}] {label} status={status} err={err or '-'} total_t={elapsed:.2f}s")
+
+        except Exception as e:  # catch all to avoid hanging q.join
+            logger.exception(f"worker crashed for idx {idx}: {e}")
+            with state["lock"]:
+                state["inflight"] -= 1
+                state["errors"]["Crash"] = state["errors"].get("Crash", 0) + 1
+                state["start_times"].pop(idx, None)
+        finally:
+            q.task_done()
 
 def progress_loop(state: dict, total: int, logger: logging.Logger, every: float, stop_evt: threading.Event):
     while not stop_evt.wait(every):
@@ -233,6 +270,9 @@ def main():
         logger.error("Install curl_cffi first: pip install curl_cffi")
         raise SystemExit(1)
 
+    # make sure the requested interpreter exists; fall back if necessary
+    interpreter = resolve_interpreter(args.interpreter, logger)
+
     url = URL_TPL.format(steam64=args.steam64)
     logger.info(f"Target: {url} | total={args.requests}, conc={args.concurrency}, engine={args.engine}")
 
@@ -263,9 +303,9 @@ def main():
     with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
         for _ in range(args.concurrency):
             ex.submit(run_worker, q, results, args.engine,
-                      (args.timeout_connect, args.timeout_read),
-                      args.retries, args.backoff, logger, state,
-                      args.verbose_requests, args.hard_timeout, args.interpreter)
+                        (args.timeout_connect, args.timeout_read),
+                        args.retries, args.backoff, logger, state,
+                        args.verbose_requests, args.hard_timeout, interpreter)
         q.join()
 
     stop_evt.set()
@@ -281,7 +321,8 @@ def main():
     p = percentiles(lat)
 
     logger.info("=== SUMMARY ===")
-    logger.info(f"total: {total} | ok: {ok} ({ok/total:.1%}) | cf-like: {cf} | errors: {errs or {}}")
+    ok_pct = (ok/total*100) if total else 0
+    logger.info(f"total: {total} | ok: {ok} ({ok_pct:.1f}%) | cf-like: {cf} | errors: {errs or {}}")
     logger.info(f"latency p50/p90/p99: {p.get(50,'-')}s / {p.get(90,'-')}s / {p.get(99,'-')}s")
 
     with open(args.csv,"w", newline="", encoding="utf-8") as f:
