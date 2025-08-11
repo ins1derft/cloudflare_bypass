@@ -1,14 +1,22 @@
 # stress_v2_3.py
-# pip install cloudscraper "requests>=2.32" curl_cffi beautifulsoup4 lxml urllib3
+# pip install selenium undetected-chromedriver "requests>=2.32" curl_cffi beautifulsoup4 lxml urllib3
 
-import argparse, csv, random, time, math, threading, logging, sys, shutil
+import argparse, csv, random, time, math, threading, logging, sys
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from typing import Dict, Any, List, Tuple
 
 import requests
-import cloudscraper
-from requests.adapters import HTTPAdapter
+import json
+import sys as _sys
+try:
+    import distutils  # noqa: F401
+except Exception:  # Python >=3.12 removed distutils
+    import setuptools._distutils as _distutils
+    _sys.modules['distutils'] = _distutils
+    _sys.modules['distutils.version'] = _distutils.version
+import undetected_chromedriver as uc
+from selenium.common.exceptions import TimeoutException
 
 try:
     from curl_cffi import requests as creq
@@ -56,22 +64,6 @@ def percentiles(vals: List[float], ps=(50,90,99)):
     return out
 
 # ---------- helpers ----------
-def resolve_interpreter(interpreter: str, logger: logging.Logger) -> str:
-    """Return a supported JS interpreter for cloudscraper.
-
-    cloudscraper works faster with NodeJS but many environments may not have
-    the ``node`` executable available.  Previously the script would silently
-    fail when ``node`` was missing which caused worker threads to die and the
-    queue to hang forever.  We now check for the presence of NodeJS and
-    transparently fall back to ``js2py`` with a warning so that requests can
-    still be executed.
-    """
-    if interpreter == "nodejs" and shutil.which("node") is None:
-        logger.warning("node interpreter not found, falling back to js2py")
-        return "js2py"
-    return interpreter
-
-
 def call_with_timeout(fn, args=(), kwargs=None, timeout=10.0):
     """Execute ``fn`` in a separate daemon thread enforcing ``timeout`` seconds."""
     result: Dict[str, Any] = {}
@@ -143,42 +135,51 @@ class ProxyPool:
         wait += self.limiters[proxy].acquire()
         return proxy, wait
 
-# ---------- engines ----------
-def make_cloudscraper(pool_size: int, interpreter: str):
-    params = dict(
-        browser={'browser':'chrome','platform':'windows','desktop':True},
-        interpreter=interpreter,
-        debug=False,
-    )
-    # "enable_stealth" was added in newer versions of cloudscraper.  For older
-    # releases the argument is unknown and would raise a TypeError which used to
-    # kill worker threads silently.  Try to enable it and gracefully fall back
-    # if the parameter isn't supported.
-    try:
-        params["enable_stealth"] = True
-        s = cloudscraper.create_scraper(**params)
-    except TypeError:
-        params.pop("enable_stealth", None)
-        s = cloudscraper.create_scraper(**params)
-    # ВНУТРЕННИЕ ретраи отключены — ретраи делаем сами с контролируемым бэк-оффом
-    adapter = HTTPAdapter(
-        pool_connections=pool_size,
-        pool_maxsize=pool_size,
-        pool_block=True,    # важен управляемый пул
-        max_retries=0
-    )
-    s.mount("https://", adapter); s.mount("http://", adapter)
-    return s
-
-def fetch_with_cloudscraper(s, url, timeout_tuple, proxies=None):
-    r = s.get(url, timeout=timeout_tuple, proxies=proxies)  # tuple: (connect, read)
-    return r.status_code, r.text, len(r.content)
-
 def fetch_with_curlcffi(url, timeout_tuple, proxies=None):
     # curl_cffi принимает один timeout; берём максимум из пары
     to = max(timeout_tuple)
     r = creq.get(url, impersonate="chrome", timeout=to, proxies=proxies)
     return r.status_code, r.text, len(r.content)
+
+
+def make_selenium_driver(proxy: str | None):
+    opts = uc.ChromeOptions()
+    opts.add_argument("--headless")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--log-level=3")
+    opts.add_argument("--disable-dev-shm-usage")
+    if proxy:
+        opts.add_argument(f"--proxy-server={proxy}")
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    driver = uc.Chrome(options=opts)
+    return driver
+
+
+def fetch_with_selenium(url, timeout_tuple, proxy=None):
+    driver = make_selenium_driver(proxy)
+    try:
+        to = max(timeout_tuple)
+        driver.set_page_load_timeout(to)
+        driver.get(url)
+        status = 0
+        try:
+            logs = driver.get_log("performance")
+            for entry in logs:
+                msg = json.loads(entry["message"])
+                if msg.get("message", {}).get("method") == "Network.responseReceived":
+                    params = msg["message"]["params"]
+                    if params.get("response", {}).get("url") == url:
+                        status = params["response"].get("status", 0)
+                        break
+        except Exception:
+            pass
+        text = driver.page_source
+        return status, text, len(text.encode("utf-8"))
+    except TimeoutException as e:
+        raise requests.exceptions.Timeout() from e
+    finally:
+        driver.quit()
 
 # ---------- worker / progress ----------
 def run_worker(q: Queue,
@@ -191,16 +192,11 @@ def run_worker(q: Queue,
                state: dict,
                verbose_requests: bool,
                hard_timeout: float,
-               interpreter: str,
                proxy_pool: ProxyPool | None,
                cache: dict | None):
-    sess = None
-    if engine == "cloudscraper":
-        try:
-            sess = make_cloudscraper(pool_size=state["pool_size"], interpreter=interpreter)
-        except Exception as e:
-            logger.error(f"failed to create cloudscraper session: {e}")
-            return
+    if engine == "curl_cffi" and not HAVE_CURLCFFI:
+        logger.error("curl_cffi requested but not installed")
+        return
 
     while True:
         try:
@@ -281,14 +277,15 @@ def run_worker(q: Queue,
                     with state["lock"]:
                         state["limiter_waits"].append(lw)
                 else:
+                    proxy = None
                     proxies = None
                 try:
                     t_req = time.perf_counter()
                     remaining = max(0.0, hard_timeout - (time.perf_counter() - t_start))
-                    if engine == "cloudscraper":
+                    if engine == "selenium":
                         status, text, bytes_ = call_with_timeout(
-                            fetch_with_cloudscraper,
-                            args=(sess, url, timeout_tuple, proxies),
+                            fetch_with_selenium,
+                            args=(url, timeout_tuple, proxy),
                             timeout=remaining
                         )
                     else:
@@ -411,14 +408,12 @@ def main():
     ap.add_argument("--steam64", default="76561197977938104")
     ap.add_argument("--requests", type=int, default=200)
     ap.add_argument("--concurrency", type=int, default=16)
-    ap.add_argument("--engine", choices=["cloudscraper","curl_cffi"], default="cloudscraper")
+    ap.add_argument("--engine", choices=["selenium","curl_cffi"], default="selenium")
     ap.add_argument("--timeout_connect", type=float, default=6.0)
     ap.add_argument("--timeout_read", type=float, default=20.0)
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--backoff", type=float, default=0.35)
     ap.add_argument("--hard-timeout", type=float, default=40.0)
-    ap.add_argument("--pool-size", type=int, default=64)
-    ap.add_argument("--interpreter", choices=["nodejs","js2py"], default="nodejs")
     ap.add_argument("--cache-ttl", type=float, default=300.0)
     ap.add_argument("--no-cache", action="store_true", help="disable result caching")
     ap.add_argument("--rate-per-proxy", type=float, default=4.0, help="req/s per proxy")
@@ -441,9 +436,6 @@ def main():
         logger.error("Install curl_cffi first: pip install curl_cffi")
         raise SystemExit(1)
 
-    # make sure the requested interpreter exists; fall back if necessary
-    interpreter = resolve_interpreter(args.interpreter, logger)
-
     url = URL_TPL.format(steam64=args.steam64)
     logger.info(f"Target: {url} | total={args.requests}, conc={args.concurrency}, engine={args.engine}")
 
@@ -460,7 +452,6 @@ def main():
         "errors": {},
         "latencies": [],
         "start_times": {},
-        "pool_size": args.pool_size,
         "rate_limited": 0,
         "queue_waits": [],
         "limiter_waits": []
@@ -486,7 +477,7 @@ def main():
             ex.submit(run_worker, q, results, args.engine,
                         (args.timeout_connect, args.timeout_read),
                         args.retries, args.backoff, logger, state,
-                        args.verbose_requests, args.hard_timeout, interpreter,
+                        args.verbose_requests, args.hard_timeout,
                         proxy_pool, cache)
         q.join()
 
