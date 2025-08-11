@@ -193,7 +193,7 @@ def run_worker(q: Queue,
                hard_timeout: float,
                interpreter: str,
                proxy_pool: ProxyPool | None,
-               cache: dict):
+               cache: dict | None):
     sess = None
     if engine == "cloudscraper":
         try:
@@ -223,44 +223,45 @@ def run_worker(q: Queue,
             # --- cache & single-flight handling ---
             cached = False
             owner = False
-            while True:
-                with cache["lock"]:
-                    entry = cache["data"].get(url)
-                    if entry and entry[0] > time.time():
-                        cached_res = entry[1]
-                        cached = True
-                        break
-                    ev = cache["pending"].get(url)
-                    if ev is None:
-                        ev = threading.Event()
-                        cache["pending"][url] = ev
-                        owner = True
-                        break
-                # another thread is fetching; wait for its event
-                ev.wait(hard_timeout)
+            if cache is not None:
+                while True:
+                    with cache["lock"]:
+                        entry = cache["data"].get(url)
+                        if entry and entry[0] > time.time():
+                            cached_res = entry[1]
+                            cached = True
+                            break
+                        ev = cache["pending"].get(url)
+                        if ev is None:
+                            ev = threading.Event()
+                            cache["pending"][url] = ev
+                            owner = True
+                            break
+                    # another thread is fetching; wait for its event
+                    ev.wait(hard_timeout)
 
-            if cached:
-                elapsed = 0.0
-                status = cached_res["status"]
-                ok = cached_res["ok"]
-                cf = cached_res["cf"]
-                err = cached_res["err"]
-                bytes_ = cached_res["bytes"]
-                if verbose_requests:
-                    logger.info(f"[{idx:04}] cache-hit")
-                with state["lock"]:
-                    state["inflight"] -= 1
-                    state["done"] += 1
-                    state["latencies"].append(elapsed)
-                    if ok: state["ok"] += 1
-                    if cf: state["cf"] += 1
-                    if err:
-                        state["errors"][err] = state["errors"].get(err, 0) + 1
-                    state["start_times"].pop(idx, None)
-                results.append({"idx": idx, "status": status, "ok": ok, "cf": cf,
-                                "err": err, "elapsed": elapsed, "bytes": bytes_,
-                                "cached": True})
-                continue
+                if cached:
+                    elapsed = 0.0
+                    status = cached_res["status"]
+                    ok = cached_res["ok"]
+                    cf = cached_res["cf"]
+                    err = cached_res["err"]
+                    bytes_ = cached_res["bytes"]
+                    if verbose_requests:
+                        logger.info(f"[{idx:04}] cache-hit")
+                    with state["lock"]:
+                        state["inflight"] -= 1
+                        state["done"] += 1
+                        state["latencies"].append(elapsed)
+                        if ok: state["ok"] += 1
+                        if cf: state["cf"] += 1
+                        if err:
+                            state["errors"][err] = state["errors"].get(err, 0) + 1
+                        state["start_times"].pop(idx, None)
+                    results.append({"idx": idx, "status": status, "ok": ok, "cf": cf,
+                                    "err": err, "elapsed": elapsed, "bytes": bytes_,
+                                    "cached": True})
+                    continue
 
             if verbose_requests:
                 logger.info(f"[{idx:04}] start engine={engine}")
@@ -356,7 +357,7 @@ def run_worker(q: Queue,
                 if err: state["errors"][err] = state["errors"].get(err, 0) + 1
                 state["start_times"].pop(idx, None)
 
-            if ok:
+            if ok and cache is not None:
                 with cache["lock"]:
                     cache["data"][url] = (time.time() + cache["ttl"],
                                              {"status": status, "ok": ok, "cf": cf,
@@ -373,7 +374,7 @@ def run_worker(q: Queue,
                 state["errors"]["Crash"] = state["errors"].get("Crash", 0) + 1
                 state["start_times"].pop(idx, None)
         finally:
-            if owner:
+            if cache is not None and owner:
                 with cache["lock"]:
                     ev = cache["pending"].pop(url, None)
                     if ev:
@@ -419,6 +420,7 @@ def main():
     ap.add_argument("--pool-size", type=int, default=64)
     ap.add_argument("--interpreter", choices=["nodejs","js2py"], default="nodejs")
     ap.add_argument("--cache-ttl", type=float, default=300.0)
+    ap.add_argument("--no-cache", action="store_true", help="disable result caching")
     ap.add_argument("--rate-per-proxy", type=float, default=4.0, help="req/s per proxy")
     ap.add_argument("--proxy-start-port", type=int, default=60000)
     ap.add_argument("--proxy-count", type=int, default=10)
@@ -465,7 +467,7 @@ def main():
     }
 
     results = []
-    cache = {"data": {}, "lock": threading.Lock(), "ttl": args.cache_ttl, "pending": {}}
+    cache = None if args.no_cache else {"data": {}, "lock": threading.Lock(), "ttl": args.cache_ttl, "pending": {}}
 
     proxies = [f"http://127.0.0.1:{args.proxy_start_port + i}" for i in range(args.proxy_count)] if args.proxy_count > 0 else []
     global_rate = args.proxy_global_rate
